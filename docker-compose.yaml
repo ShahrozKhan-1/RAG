@@ -1,0 +1,20 @@
+services:
+  model-bootstrap:
+    image: busybox:latest
+    command: ["sleep", "infinity"]
+    models:
+      - llm
+      - embedding
+
+models:
+  llm:
+    model: ai/qwen3:1.7b-q4_K_M
+    context_size: 4096
+
+  embedding:
+    model: ai/nomic-embed-text-v1.5
+    context_size: 8192
+    runtime_flags:
+      - "--embeddings"
+      - "--ubatch-size"
+      - "2048"
