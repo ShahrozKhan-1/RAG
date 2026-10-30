@@ -1,32 +1,30 @@
 from sentence_transformers import CrossEncoder
 
 
+_RERANKER_MODEL_NAME = "BAAI/bge-reranker-base"
+_reranker = CrossEncoder(_RERANKER_MODEL_NAME)
 
-reranker = CrossEncoder("BAAI/bge-reranker-base")
 
-
-def rerank_chunks(query: str, chunks: list[str], top_k: int = 5) -> list[str]:
+def rerank_chunks(query: str, chunks: list[dict], top_k: int = 8) -> list[dict]:
     if not chunks:
         return []
 
-    pairs = [
+    chunks_with_text = [chunk for chunk in chunks if chunk.get("text")]
+    if not chunks_with_text:
+        return []
+
+    query_chunk_pairs = [
         (query, chunk["text"])
-        for chunk in chunks
+        for chunk in chunks_with_text
     ]
+    scores = _reranker.predict(query_chunk_pairs)
 
-    scores = reranker.predict(pairs)
-
-    ranked = []
-
-    for chunk, score in zip(chunks, scores):
-        ranked.append({
-            **chunk,
-            "rerank_score": float(score)
-        })
-
-    ranked.sort(
-        key=lambda item: item["rerank_score"],
-        reverse=True
+    ranked_chunks = [
+        {**chunk, "rerank_score": float(score)}
+        for chunk, score in zip(chunks_with_text, scores)
+    ]
+    ranked_chunks.sort(
+        key=lambda chunk: chunk["rerank_score"],
+        reverse=True,
     )
-
-    return ranked[:top_k]
+    return ranked_chunks[:top_k]

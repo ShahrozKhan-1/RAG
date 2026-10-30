@@ -1,11 +1,10 @@
-lazy from system_prompt import RETRIEVAL_SYSTEM_PROMPT
-lazy from config import gemini_llm
-lazy from retrieval import retrieve
-lazy from augmentation import augment_query
 from concurrent.futures import ThreadPoolExecutor, as_completed
-lazy from reranker import rerank_chunks
 
-
+from augmentation import augment_query
+from config import gemini_llm
+from reranker import rerank_chunks
+from retrieval import retrieve
+from system_prompt import RETRIEVAL_SYSTEM_PROMPT
 
 
 def build_prompt(query: str, hits: list[dict]) -> str:
@@ -22,34 +21,39 @@ def main() -> None:
         return
 
     augmented_queries = augment_query(query)
-    
+
     print("\n--- Augmented Queries ---")
-    for i, q in enumerate(augmented_queries, 1):
-        print(f"{i}. {q}")
-    
+    for query_number, search_query in enumerate(augmented_queries, start=1):
+        print(f"{query_number}. {search_query}")
+
     print("\nRetrieving in parallel...")
-    
-    all_hits = []
-    seen_ids = set()
-    
+
+    retrieved_hits: list[dict] = []
+    seen_chunk_ids: set[str] = set()
+
     with ThreadPoolExecutor(max_workers=len(augmented_queries)) as executor:
-        future_to_query = {executor.submit(retrieve, q): q for q in augmented_queries}
-        for future in as_completed(future_to_query):
+        retrieval_futures = [
+            executor.submit(retrieve, search_query)
+            for search_query in augmented_queries
+        ]
+        for future in as_completed(retrieval_futures):
             try:
                 hits = future.result()
                 if hits:
                     for hit in hits:
-                        if hit["id"] not in seen_ids:
-                            seen_ids.add(hit["id"])
-                            all_hits.append(hit)
-            except Exception as e:
-                print(f"⚠️ Retrieval failed for a query: {e}")
-                
-    max_context_hits = 15
-    final_hits = all_hits[:max_context_hits]
-    
+                        chunk_id = hit["id"]
+                        if chunk_id in seen_chunk_ids:
+                            continue
+                        seen_chunk_ids.add(chunk_id)
+                        retrieved_hits.append(hit)
+            except Exception as error:
+                print(f"⚠️ Retrieval failed for a query: {error}")
+
+    context_hit_limit = 15
+    final_hits = retrieved_hits[:context_hit_limit]
+
     print(f"Retrieved {len(final_hits)} unique chunks.")
-    
+
     if not final_hits:
         print("No results.")
         return
@@ -58,16 +62,13 @@ def main() -> None:
     if not ranked_hits:
         print("No results.")
         return
-    print("ranked hits: ", ranked_hits)
 
     print("\nAsking LLM...")
-    prompt = build_prompt(query, ranked_hits) 
-    # response = llm(prompt, system_prompt=RETRIEVAL_SYSTEM_PROMPT)
+    prompt = build_prompt(query, ranked_hits)
     response = gemini_llm(query=prompt, system_prompt=RETRIEVAL_SYSTEM_PROMPT)
 
     print("\n=== Answer ===")
     print(response)
-
 
 
 if __name__ == "__main__":

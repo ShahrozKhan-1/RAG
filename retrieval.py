@@ -1,18 +1,41 @@
-from concurrent.futures import ThreadPoolExecutor
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 import math
 import re
+from typing import Any
 
-from config import embedding, vector_Store
-
+from config import embedding, vector_store
 
 
 _TOKEN_PATTERN = re.compile(r"[\w]+(?:[.,/%-][\w]+)*", re.UNICODE)
+
 _BM25_K1 = 1.5
 _BM25_B = 0.3
 _RRF_K = 60
-_DENSE_WEIGHT = 0.7
-_BM25_WEIGHT = 1.3
+_DENSE_WEIGHT = 1.0
+_BM25_WEIGHT = 1.0
+_MAX_DENSE_DISTANCE = 1.2
+_PER_TABLE_SIBLING_CAP = 6
+
+_corpus_cache: dict[str, Any] = {
+    "collection_count": None,
+    "corpus": None,
+}
+
+
+def _get_corpus() -> dict:
+    collection_count = vector_store.count()
+    cached_corpus = _corpus_cache["corpus"]
+    if (
+        _corpus_cache["collection_count"] == collection_count
+        and cached_corpus is not None
+    ):
+        return cached_corpus
+
+    corpus = vector_store.get(include=["documents", "metadatas"])
+    _corpus_cache["collection_count"] = collection_count
+    _corpus_cache["corpus"] = corpus
+    return corpus
 
 
 def _tokenize(text: str) -> list[str]:
@@ -20,33 +43,43 @@ def _tokenize(text: str) -> list[str]:
 
 
 def _is_valid_chunk(hit: dict) -> bool:
-    metadata = hit["metadata"]
-    types = metadata.get("types", [])
-    if "table" not in types:
+    metadata = hit.get("metadata") or {}
+    section_path = " ".join(metadata.get("section_path") or []).lower()
+    is_excluded_section = (
+        "acknowledgement" in section_path or "contents" in section_path
+    )
+    if is_excluded_section:
         return False
-    section_path = " ".join(metadata.get("section_path", [])).lower()
-    if "acknowledgement" in section_path or "contents" in section_path:
-        return False
-    page_start = metadata.get("page_start", 100)
-    if page_start <= 10:
-        return False
-    text = hit.get("text", "").lower()
-    if "contents" in text and "page no." in text:
-        return False
-    return True
 
-def _dense_retrieve(query: str, n_results: int) -> list[dict]:
-    query_embed = embedding("search_query: " + query)
-    results = vector_Store.query(query_embeddings=query_embed, n_results=n_results)
-    return [
-        {
-            "id": results["ids"][0][i],
-            "text": results["documents"][0][i],
-            "metadata": results["metadatas"][0][i],
-            "distance": results["distances"][0][i],
-        }
-        for i in range(len(results["ids"][0]))
-    ]
+    text = (hit.get("text") or "").lower()
+    is_table_of_contents = "contents" in text and "page no." in text
+    return not is_table_of_contents
+
+
+def _dense_retrieve(
+    query: str,
+    n_results: int,
+    max_distance: float = _MAX_DENSE_DISTANCE,
+) -> list[dict]:
+    query_embedding = embedding("search_query: " + query)
+    results = vector_store.query(
+        query_embeddings=query_embedding,
+        n_results=n_results,
+    )
+
+    hits: list[dict] = []
+    for result_index, distance in enumerate(results["distances"][0]):
+        if distance is not None and distance > max_distance:
+            continue
+        hits.append(
+            {
+                "id": results["ids"][0][result_index],
+                "text": results["documents"][0][result_index],
+                "metadata": results["metadatas"][0][result_index] or {},
+                "distance": distance,
+            }
+        )
+    return hits
 
 
 def _bm25_retrieve(query: str, n_results: int) -> list[dict]:
@@ -54,123 +87,155 @@ def _bm25_retrieve(query: str, n_results: int) -> list[dict]:
     if not query_tokens:
         return []
 
-    corpus = vector_Store.get(include=["documents", "metadatas"])
+    corpus = _get_corpus()
     documents = [
-        (doc_id, text, metadata or {})
-        for doc_id, text, metadata in zip(
-            corpus["ids"], corpus["documents"], corpus["metadatas"]
+        (document_id, text, metadata or {})
+        for document_id, text, metadata in zip(
+            corpus["ids"],
+            corpus["documents"],
+            corpus["metadatas"],
         )
         if isinstance(text, str)
     ]
     if not documents:
         return []
 
-    tokenized = [_tokenize(text) for _, text, _ in documents]
-    document_count = len(tokenized)
-    average_length = sum(map(len, tokenized)) / document_count or 1
-    document_frequency: Counter[str] = Counter()
-    for tokens in tokenized:
-        document_frequency.update(set(tokens))
+    tokenized_documents = [
+        _tokenize(text)
+        for _, text, _ in documents
+    ]
+    document_count = len(tokenized_documents)
+    average_document_length = (
+        sum(map(len, tokenized_documents)) / document_count or 1
+    )
 
-    scores = []
-    for (doc_id, text, metadata), tokens in zip(documents, tokenized):
-        term_frequency = Counter(tokens)
+    document_frequency: Counter[str] = Counter()
+    for document_tokens in tokenized_documents:
+        document_frequency.update(set(document_tokens))
+
+    scored_documents: list[dict] = []
+    for document, document_tokens in zip(documents, tokenized_documents):
+        document_id, text, metadata = document
+        term_frequency = Counter(document_tokens)
         score = 0.0
-        for term in query_tokens:
-            frequency = term_frequency[term]
+
+        for query_token in query_tokens:
+            frequency = term_frequency[query_token]
             if not frequency:
                 continue
+
             inverse_frequency = math.log(
                 1
-                + (document_count - document_frequency[term] + 0.5)
-                / (document_frequency[term] + 0.5)
+                + (document_count - document_frequency[query_token] + 0.5)
+                / (document_frequency[query_token] + 0.5)
             )
             length_normalization = _BM25_K1 * (
-                1 - _BM25_B + _BM25_B * len(tokens) / average_length
+                1
+                - _BM25_B
+                + _BM25_B * len(document_tokens) / average_document_length
             )
             score += inverse_frequency * (
                 frequency * (_BM25_K1 + 1)
             ) / (frequency + length_normalization)
 
         if score > 0:
-            scores.append(
+            scored_documents.append(
                 {
-                    "id": doc_id,
+                    "id": document_id,
                     "text": text,
                     "metadata": metadata,
                     "bm25_score": score,
                 }
             )
 
-    scores.sort(key=lambda hit: hit["bm25_score"], reverse=True)
-    return scores[:n_results]
+    scored_documents.sort(
+        key=lambda hit: hit["bm25_score"],
+        reverse=True,
+    )
+    return scored_documents[:n_results]
 
 
-def _expand_table_siblings(hits: list[dict], max_total: int) -> list[dict]:
+def _expand_table_siblings(
+    hits: list[dict],
+    max_total: int,
+    per_table_cap: int = _PER_TABLE_SIBLING_CAP,
+) -> list[dict]:
+    if not hits:
+        return []
+
     table_ids = {
-        tid for hit in hits for tid in hit["metadata"].get("table_ids", [])
+        table_id
+        for hit in hits
+        for table_id in (hit["metadata"].get("table_ids") or [])
     }
     if not table_ids:
         return hits[:max_total]
 
-    # FIXED: ChromaDB silently fails with $in on array metadata. 
-    # We fetch and filter in Python to guarantee it works.
-    corpus = vector_Store.get(include=["documents", "metadatas"])
-    
-    siblings = {}
-    for cid, text, meta in zip(corpus["ids"], corpus["documents"], corpus["metadatas"]):
+    corpus = _get_corpus()
+    siblings_by_table: dict[str, list[dict]] = {}
+    for chunk_id, text, metadata in zip(
+        corpus["ids"],
+        corpus["documents"],
+        corpus["metadatas"],
+    ):
         if not isinstance(text, str):
             continue
-        # If this chunk belongs to any of the tables we care about, grab it.
-        if set(meta.get("table_ids", [])) & table_ids:
-            siblings[cid] = {
-                "id": cid,
-                "text": text,
-                "metadata": meta,
-                "distance": None,
-                "bm25_score": 0.0,
-                "hybrid_score": 0.0,
-            }
-            
-    merged = {hit["id"]: hit for hit in hits}
-    merged.update(siblings)
 
-    # Group by table, then by chunk id so chunks stay in document order
-    return sorted(
-        merged.values(),
-        key=lambda h: (
-            (h["metadata"].get("table_ids") or [""])[0],
-            h["id"],
-        ),
-    )[:max_total]
+        chunk_metadata = metadata or {}
+        for table_id in chunk_metadata.get("table_ids") or []:
+            if table_id not in table_ids:
+                continue
+            siblings_by_table.setdefault(table_id, []).append(
+                {
+                    "id": chunk_id,
+                    "text": text,
+                    "metadata": chunk_metadata,
+                    "distance": None,
+                    "bm25_score": 0.0,
+                    "hybrid_score": 0.0,
+                }
+            )
+
+    expanded_hits: list[dict] = []
+    seen_chunk_ids: set[str] = set()
+
+    for hit in hits:
+        chunk_id = hit["id"]
+        if chunk_id not in seen_chunk_ids:
+            expanded_hits.append(hit)
+            seen_chunk_ids.add(chunk_id)
+
+        for table_id in hit["metadata"].get("table_ids") or []:
+            added_siblings = 0
+            siblings = sorted(
+                siblings_by_table.get(table_id, []),
+                key=lambda sibling: sibling["id"],
+            )
+            for sibling in siblings:
+                if added_siblings >= per_table_cap:
+                    break
+                if sibling["id"] in seen_chunk_ids:
+                    continue
+
+                expanded_hits.append(sibling)
+                seen_chunk_ids.add(sibling["id"])
+                added_siblings += 1
+
+        if len(expanded_hits) >= max_total:
+            break
+
+    return expanded_hits[:max_total]
 
 
-def retrieve(query: str, k: int = 5) -> list[dict]:
-    if k < 1:
-        raise ValueError("k must be at least 1")
-    if not query.strip():
-        return []
+def _fuse_ranked_hits(
+    dense_hits: list[dict],
+    bm25_hits: list[dict],
+    limit: int,
+) -> list[dict]:
+    fused_hits: dict[str, dict] = {}
 
-    collection_size = vector_Store.count()
-    if collection_size == 0:
-        return []
-
-    # Bumped candidate count to 40 for better recall on 780 chunks
-    candidate_count = min(collection_size, max(k * 8, 40))
-    
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        dense_future = executor.submit(_dense_retrieve, query, candidate_count)
-        bm25_future = executor.submit(_bm25_retrieve, query, candidate_count)
-        
-        # Strict metadata filtering applied here
-        dense_hits = [h for h in dense_future.result() if _is_valid_chunk(h)]
-        bm25_hits = [h for h in bm25_future.result() if _is_valid_chunk(h)]
-
-    fused: dict[str, dict] = {}
-    
-    # --- WEIGHTED RRF: Dense ---
     for rank, hit in enumerate(dense_hits, start=1):
-        candidate = fused.setdefault(
+        candidate = fused_hits.setdefault(
             hit["id"],
             {
                 "id": hit["id"],
@@ -181,11 +246,12 @@ def retrieve(query: str, k: int = 5) -> list[dict]:
                 "hybrid_score": 0.0,
             },
         )
-        candidate["hybrid_score"] += _DENSE_WEIGHT * (1 / (_RRF_K + rank))
+        candidate["hybrid_score"] += _DENSE_WEIGHT * (
+            1.0 / (_RRF_K + rank)
+        )
 
-    # --- WEIGHTED RRF: BM25 ---
     for rank, hit in enumerate(bm25_hits, start=1):
-        candidate = fused.setdefault(
+        candidate = fused_hits.setdefault(
             hit["id"],
             {
                 "id": hit["id"],
@@ -197,58 +263,54 @@ def retrieve(query: str, k: int = 5) -> list[dict]:
             },
         )
         candidate["bm25_score"] = hit["bm25_score"]
-        candidate["hybrid_score"] += _BM25_WEIGHT * (1 / (_RRF_K + rank))
+        candidate["hybrid_score"] += _BM25_WEIGHT * (
+            1.0 / (_RRF_K + rank)
+        )
 
-    top_hits = sorted(
-        fused.values(),
+    return sorted(
+        fused_hits.values(),
         key=lambda hit: hit["hybrid_score"],
         reverse=True,
-    )[:k]
-
-    # Expand to grab the rest of the table (e.g., c213#0 AND c213#1)
-    return _expand_table_siblings(top_hits, max_total=max(k * 2, 12))
+    )[:limit]
 
 
+def retrieve(query: str, k: int = 5) -> list[dict]:
+    if k < 1:
+        raise ValueError("k must be at least 1")
+    if not query.strip():
+        return []
 
+    collection_size = vector_store.count()
+    if collection_size == 0:
+        return []
 
+    candidate_count = min(collection_size, max(k * 8, 40))
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        dense_future = executor.submit(
+            _dense_retrieve,
+            query,
+            candidate_count,
+        )
+        bm25_future = executor.submit(
+            _bm25_retrieve,
+            query,
+            candidate_count,
+        )
 
-# results = vector_Store.get(include=["documents", "metadatas"])
-# found = False
-# for cid, text, meta in zip(results["ids"], results["documents"], results["metadatas"]):
-#     # Look for the table title or specific text from Table 6.10
-#     if "Province/Region-wise Advances" in text or "place of Disbursement" in text:
-#         print(f"✅ Found chunk: {cid} | Page: {meta.get('page_start')}")
-#         print(f"Types: {meta.get('types')} | Table IDs: {meta.get('table_ids')}")
-#         print(f"Text preview: {text[:300]}...\n")
-#         found = True
+        dense_hits = [
+            hit
+            for hit in dense_future.result()
+            if _is_valid_chunk(hit)
+        ]
+        bm25_hits = [
+            hit
+            for hit in bm25_future.result()
+            if _is_valid_chunk(hit)
+        ]
 
-# if not found:
-#     print("❌ Table 6.10 was NOT ingested into the database!")
-
-
-
-
-# def get_chunk_by_id(chunk_id: str) -> str:
-#     """Fetches the raw text of a specific chunk ID from ChromaDB."""
-    
-#     results = vector_Store.get(
-#         ids=[chunk_id],
-#         include=["documents", "metadatas"]
-#     )
-    
-#     if not results["documents"] or not results["documents"][0]:
-#         print(f"Chunk '{chunk_id}' not found.")
-#         return ""
-        
-#     text = results["documents"][0]
-#     metadata = results["metadatas"][0]
-    
-#     print(f"--- Chunk {chunk_id} ---")
-#     print(f"Page: {metadata.get('page_start')} | Section: {metadata.get('section_path')}")
-#     print("-" * 40)
-#     print(text)
-    
-#     return text
-
-
-# get_chunk_by_id("c178#0")
+    top_hits = _fuse_ranked_hits(dense_hits, bm25_hits, k)
+    return _expand_table_siblings(
+        top_hits,
+        max_total=max(k * 2, 12),
+        per_table_cap=_PER_TABLE_SIBLING_CAP,
+    )
