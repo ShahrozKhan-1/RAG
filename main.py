@@ -22,12 +22,6 @@ def main() -> None:
 
     augmented_queries = augment_query(query)
 
-    print("\n--- Augmented Queries ---")
-    for query_number, search_query in enumerate(augmented_queries, start=1):
-        print(f"{query_number}. {search_query}")
-
-    print("\nRetrieving in parallel...")
-
     retrieved_hits: list[dict] = []
     seen_chunk_ids: set[str] = set()
 
@@ -52,8 +46,6 @@ def main() -> None:
     context_hit_limit = 15
     final_hits = retrieved_hits[:context_hit_limit]
 
-    print(f"Retrieved {len(final_hits)} unique chunks.")
-
     if not final_hits:
         print("No results.")
         return
@@ -63,11 +55,9 @@ def main() -> None:
         print("No results.")
         return
 
-    print("\nAsking LLM...")
     prompt = build_prompt(query, ranked_hits)
     response = gemini_llm(query=prompt, system_prompt=RETRIEVAL_SYSTEM_PROMPT)
 
-    print("\n=== Answer ===")
     print(response)
 
 
