@@ -1,8 +1,20 @@
+from threading import Lock
+
 from sentence_transformers import CrossEncoder
 
 
 _RERANKER_MODEL_NAME = "BAAI/bge-reranker-base"
-_reranker = CrossEncoder(_RERANKER_MODEL_NAME)
+_reranker: CrossEncoder | None = None
+_reranker_lock = Lock()
+
+
+def _get_reranker() -> CrossEncoder:
+    global _reranker
+    if _reranker is None:
+        with _reranker_lock:
+            if _reranker is None:
+                _reranker = CrossEncoder(_RERANKER_MODEL_NAME)
+    return _reranker
 
 
 def rerank_chunks(query: str, chunks: list[dict], top_k: int = 8) -> list[dict]:
@@ -17,7 +29,7 @@ def rerank_chunks(query: str, chunks: list[dict], top_k: int = 8) -> list[dict]:
         (query, chunk["text"])
         for chunk in chunks_with_text
     ]
-    scores = _reranker.predict(query_chunk_pairs)
+    scores = _get_reranker().predict(query_chunk_pairs)
 
     ranked_chunks = [
         {**chunk, "rerank_score": float(score)}
